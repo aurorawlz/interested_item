@@ -127,6 +127,17 @@ def fft_fingerprint(signal):
         return spectrum.tolist()
     return (spectrum / norm).tolist()
 
+def _gather_frames(stream, first_chunk: np.ndarray, frames: int) -> np.ndarray:
+    """在触发后连续采集多帧数据，并与触发帧拼接为更长的信号。"""
+    if frames <= 1:
+        return first_chunk
+    buf = [first_chunk]
+    for _ in range(frames - 1):
+        raw = stream.read(CHUNK, exception_on_overflow=False)
+        arr = np.frombuffer(raw, dtype=np.int16)
+        buf.append(arr)
+    return np.concatenate(buf)
+
 def cosine_similarity(vec_a, vec_b):
     # 两向量需同长度；若不同，截断为最短长度
     n = min(len(vec_a), len(vec_b))
@@ -156,7 +167,7 @@ def draw_bar(energy, is_ready):
     sys.stdout.write(f"\r能量: [{bar}] {int(energy)} | {status}")
     sys.stdout.flush()
 
-def run_detector(use_map=False, record_note=None, record_key=None, sim_threshold=0.9, min_energy=1e7, build_map=False):
+def run_detector(use_map=False, record_note=None, record_key=None, sim_threshold=0.9, min_energy=1e7, build_map=False, fp_frames=8):
     p = pyaudio.PyAudio()
     stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
 
@@ -201,48 +212,42 @@ def run_detector(use_map=False, record_note=None, record_key=None, sim_threshold
                     # 🎯 触发识别！
                     # 换行打印以免破坏进度条显示
                     sys.stdout.write("\n") 
+                    # 采集更长的指纹窗口
+                    combined = _gather_frames(stream, data_int, fp_frames)
                     if build_map:
                         # 交互式建表：为当前触发的 FFT 指纹绑定 NOTE 与 KEY
-                        fp = fft_fingerprint(data_int.astype(float))
+                        fp = fft_fingerprint(combined.astype(float))
+                        # 自动生成编号，如 FP001、FP002...
+                        idx = max(
+                            [
+                                int(k[2:]) for k in fingerprints.keys()
+                                if isinstance(k, str) and k.startswith("FP") and k[2:].isdigit()
+                            ]
+                        , default=0) + 1
+                        note_input = f"FP{idx:03d}"
+                        print(f"ℹ️ 已分配默认编号: {note_input}")
                         try:
-                            note_input = input("请输入音符名(如 G3、F#3)：").strip()
+                            key_input = input("请输入要绑定的键(如 a/space/enter/1 等)：").strip()
                         except EOFError:
-                            note_input = ""
-                        if not note_input:
-                            # 未输入音符名则自动生成编号，如 FP001、FP002...
-                            idx = max(
-                                [
-                                    int(k[2:]) for k in fingerprints.keys()
-                                    if isinstance(k, str) and k.startswith("FP") and k[2:].isdigit()
-                                ]
-                            , default=0) + 1
-                            note_input = f"FP{idx:03d}"
-                            print(f"ℹ️ 未输入音符名，已使用默认编号: {note_input}")
-                        if note_input:
-                            try:
-                                key_input = input("请输入要绑定的键(如 a/space/enter/1 等)：").strip()
-                            except EOFError:
-                                key_input = ""
-                            # 写入指纹库
-                            fingerprints[note_input] = {
-                                "fingerprint": fp,
-                                "key": key_input
-                            }
-                            ok_fp = save_fingerprints(fingerprints)
-                            # 同步到映射文件（可选，作为回退）
-                            if key_input:
-                                mapping[note_input] = key_input
-                                ok_map = save_mapping(mapping)
-                            else:
-                                ok_map = True
-                            status_fp = "✅ 指纹已保存" if ok_fp else "❌ 指纹保存失败"
-                            status_map = "✅ 映射已保存" if ok_map else "❌ 映射保存失败"
-                            print(f"{status_fp} 到 {FINGERPRINT_FILE}；{status_map} 到 {MAPPING_FILE}")
+                            key_input = ""
+                        # 写入指纹库
+                        fingerprints[note_input] = {
+                            "fingerprint": fp,
+                            "key": key_input
+                        }
+                        ok_fp = save_fingerprints(fingerprints)
+                        # 同步到映射文件（可选，作为回退）
+                        if key_input:
+                            mapping[note_input] = key_input
+                            ok_map = save_mapping(mapping)
                         else:
-                            print("ℹ️ 未输入音符名，已跳过本次录入。")
+                            ok_map = True
+                        status_fp = "✅ 指纹已保存" if ok_fp else "❌ 指纹保存失败"
+                        status_map = "✅ 映射已保存" if ok_map else "❌ 映射保存失败"
+                        print(f"{status_fp} 到 {FINGERPRINT_FILE}；{status_map} 到 {MAPPING_FILE}")
                     elif record_note:
                         # 指纹录入模式：保存当前 FFT 指纹到库
-                        fp = fft_fingerprint(data_int.astype(float))
+                        fp = fft_fingerprint(combined.astype(float))
                         fingerprints[record_note] = {
                             "fingerprint": fp,
                             "key": record_key or mapping.get(record_note, "")
@@ -253,7 +258,7 @@ def run_detector(use_map=False, record_note=None, record_key=None, sim_threshold
                             print(f"❌ 指纹写入失败: {FINGERPRINT_FILE}")
                     else:
                         # 指纹比对模式（默认）
-                        fp_cur = fft_fingerprint(data_int.astype(float))
+                        fp_cur = fft_fingerprint(combined.astype(float))
                         best_note = None
                         best_sim = 0.0
                         for n, item in fingerprints.items():
@@ -261,7 +266,7 @@ def run_detector(use_map=False, record_note=None, record_key=None, sim_threshold
                             if sim > best_sim:
                                 best_sim = sim
                                 best_note = n
-                        energy = np.sum(data_int.astype(float)**2)
+                        energy = np.sum(combined.astype(float)**2)
                         print(f"🔎 最相似: {best_note} | 相似度: {best_sim:.3f}")
                         if best_note and best_sim >= sim_threshold and energy >= min_energy:
                             key = fingerprints.get(best_note, {}).get("key", mapping.get(best_note, ""))
@@ -309,6 +314,7 @@ def main():
     parser.add_argument("--record-key", metavar="KEY", help="与 --record-fp 一起使用，指定该音符的键映射")
     parser.add_argument("--sim-th", type=float, default=0.9, help="指纹相似度阈值，默认 0.9")
     parser.add_argument("--min-energy", type=float, default=1e7, help="能量阈值，默认 1e7")
+    parser.add_argument("--fp-frames", type=int, default=8, help="录入/匹配指纹时连续采集的帧数，默认 8")
     args = parser.parse_args()
 
     run_detector(
@@ -318,6 +324,7 @@ def main():
         sim_threshold=args.sim_th,
         min_energy=args.min_energy,
         build_map=args.build_map,
+        fp_frames=args.fp_frames,
     )
 
 if __name__ == "__main__":
