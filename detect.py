@@ -267,7 +267,11 @@ def run_detector(use_map=False, record_note=None, record_key=None, sim_threshold
                                 best_sim = sim
                                 best_note = n
                         energy = np.sum(combined.astype(float)**2)
-                        print(f"🔎 最相似: {best_note} | 相似度: {best_sim:.3f}")
+                        preview_key = None
+                        if best_note:
+                            preview_key = fingerprints.get(best_note, {}).get("key", mapping.get(best_note, ""))
+                        shown = preview_key if (preview_key and isinstance(preview_key, str) and len(preview_key) > 0) else best_note
+                        print(f"🔎 最相似: {shown} | 相似度: {best_sim:.3f}")
                         if best_note and best_sim >= sim_threshold and energy >= min_energy:
                             key = fingerprints.get(best_note, {}).get("key", mapping.get(best_note, ""))
                             if key:
