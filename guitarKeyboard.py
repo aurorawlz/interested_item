@@ -230,21 +230,22 @@ def run_detector(use_map=False, record_note=None, record_key=None, sim_threshold
                             key_input = input("请输入要绑定的键(如 a/space/enter/1 等)：").strip()
                         except EOFError:
                             key_input = ""
-                        # 写入指纹库
-                        fingerprints[note_input] = {
-                            "fingerprint": fp,
-                            "key": key_input
-                        }
-                        ok_fp = save_fingerprints(fingerprints)
-                        # 同步到映射文件（可选，作为回退）
-                        if key_input:
+                        # 若未输入键名，则不保存指纹与映射
+                        if not key_input:
+                            print("ℹ️ 未输入键名，已跳过本次指纹保存。")
+                        else:
+                            # 写入指纹库
+                            fingerprints[note_input] = {
+                                "fingerprint": fp,
+                                "key": key_input
+                            }
+                            ok_fp = save_fingerprints(fingerprints)
+                            # 同步到映射文件（回退用）
                             mapping[note_input] = key_input
                             ok_map = save_mapping(mapping)
-                        else:
-                            ok_map = True
-                        status_fp = "✅ 指纹已保存" if ok_fp else "❌ 指纹保存失败"
-                        status_map = "✅ 映射已保存" if ok_map else "❌ 映射保存失败"
-                        print(f"{status_fp} 到 {FINGERPRINT_FILE}；{status_map} 到 {MAPPING_FILE}")
+                            status_fp = "✅ 指纹已保存" if ok_fp else "❌ 指纹保存失败"
+                            status_map = "✅ 映射已保存" if ok_map else "❌ 映射保存失败"
+                            print(f"{status_fp} 到 {FINGERPRINT_FILE}；{status_map} 到 {MAPPING_FILE}")
                     elif record_note:
                         # 指纹录入模式：保存当前 FFT 指纹到库
                         fp = fft_fingerprint(combined.astype(float))
