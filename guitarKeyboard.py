@@ -13,6 +13,8 @@ except Exception:
     KEYBOARD_AVAILABLE = False
     _kb = None
 
+#根据当前架子鼓存在鼓 进行修改
+
 # --- 🎛️ 核心参数调试区 ---
 
 # 1. 触发阈值 (ONSET): 只有能量突变量超过这个值，才判定为拨弦
