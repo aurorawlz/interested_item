@@ -15,6 +15,7 @@ python drum_simple.py --quick-setup
 2. 录制你的实际鼓声
 python drum_simple.py --record
 # 按照提示，为每个鼓件录制轻击和重击
+python durm_simple.py --record-drum "mysnare" --record-key "o"
 
 3. 开始使用
 python drum_simple.py --use
@@ -38,7 +39,7 @@ try:
     _kb = Controller()
 except Exception:
     KEYBOARD_AVAILABLE = False
-    _kb = None
+    _kb = Noney
 
 # --- 🥁 两种力度配置 ---
 ONSET_THRESHOLD = 3e8  # 触发阈值
