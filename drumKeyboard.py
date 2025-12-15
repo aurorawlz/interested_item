@@ -15,32 +15,151 @@ except Exception:
     KEYBOARD_AVAILABLE = False
     _kb = None
 
-# --- 🎛️ 核心参数调试区 ---
+# --- 🥁 架子鼓专用参数 ---
+# 打击乐瞬态明显，可以调高触发阈值，防止误触发
+ONSET_THRESHOLD = 5e8  # 调高：需要明确的打击才能触发
+RESET_THRESHOLD = 1e8  # 调高：快速复位，支持连续打击
+MIN_ENERGY = 2e7  # 最低能量阈值，过滤轻微触碰
 
-# 1. 触发阈值 (ONSET): 只有能量突变量超过这个值，才判定为拨弦
-#    调大 = 需要更用力拨弦才能触发
-#    调小 = 更灵敏
-ONSET_THRESHOLD = 2e8
-
-# 2. 复位阈值 (RESET): 只有当前总能量低于这个值，系统才会“解锁”，准备下一次识别
-#    这个值必须比拨弦时的能量低很多，但要比背景噪音高
-#    如果你的弦一直在响导致无法识别下一次，请调大这个值
-RESET_THRESHOLD = 8e7
-
-# --- 其他参数 ---
-CHUNK = 2048
+# 打击乐分析窗口更短
+CHUNK = 1024  # 减小块大小，提高响应速度
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 44100
 
-# 键盘映射文件路径
-MAPPING_FILE = os.path.join(os.path.dirname(__file__), "guitar_mapping.json")
-FINGERPRINT_FILE = os.path.join(os.path.dirname(__file__), "fingerprints.json")
+# 指纹参数调整
+FP_FRAMES = 4  # 减少到4帧，鼓声短不需要太长分析
+PEAK_RATIO = 0.7  # 主峰占比，用于区分音色
+
+# 文件路径
+MAPPING_FILE = os.path.join(os.path.dirname(__file__), "drum_mapping.json")
+FINGERPRINT_FILE = os.path.join(os.path.dirname(__file__), "drum_fingerprints.json")
+DRUM_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "drum_config.json")
+
+
+
+def load_drum_config():
+    """加载架子鼓专用配置"""
+    default_config = {
+        "sensitivity": {
+            "kick": 0.8,  # 地鼓灵敏度
+            "snare": 1.0,  # 军鼓灵敏度
+            "hihat": 1.2,  # 踩镲灵敏度
+            "tom": 0.9,  # 通鼓灵敏度
+            "cymbal": 1.3  # 镲片灵敏度
+        },
+        "velocity_thresholds": {
+            "soft": 1e8,  # 轻击阈值
+            "medium": 3e8,  # 中击阈值
+            "hard": 6e8  # 重击阈值
+        }
+    }
+
+    if os.path.exists(DRUM_CONFIG_FILE):
+        try:
+            with open(DRUM_CONFIG_FILE, "r", encoding="utf-8") as f:
+                user_config = json.load(f)
+                # 合并配置
+                for key in default_config:
+                    if key in user_config:
+                        default_config[key].update(user_config[key])
+        except Exception:
+            pass
+
+    return default_config
+
+
+def extract_drum_features(signal):
+    """提取打击乐特征"""
+    # 1. 能量特征
+    energy = np.sum(signal.astype(float) ** 2)
+
+    # 2. 频谱特征
+    windowed = signal * np.hanning(len(signal))
+    spectrum = np.abs(np.fft.rfft(windowed))
+
+    # 3. 打击乐重要频段
+    # 低频段 (50-200Hz): 地鼓
+    # 中频段 (200-800Hz): 军鼓
+    # 高频段 (2k-8kHz): 踩镲
+    freq_bins = len(spectrum)
+    freq_resolution = RATE / 2 / freq_bins
+
+    # 计算各频段能量
+    low_band = np.sum(spectrum[int(50 / freq_resolution):int(200 / freq_resolution)])
+    mid_band = np.sum(spectrum[int(200 / freq_resolution):int(800 / freq_resolution)])
+    high_band = np.sum(spectrum[int(2000 / freq_resolution):int(8000 / freq_resolution)])
+
+    total_spectrum = np.sum(spectrum)
+
+    features = {
+        "energy": float(energy),
+        "low_ratio": float(low_band / total_spectrum if total_spectrum > 0 else 0),
+        "mid_ratio": float(mid_band / total_spectrum if total_spectrum > 0 else 0),
+        "high_ratio": float(high_band / total_spectrum if total_spectrum > 0 else 0),
+        "attack_slope": float(np.max(np.diff(signal[:100])) if len(signal) > 100 else 0),
+        "peak_count": int(np.sum(spectrum > np.mean(spectrum) * 2)),
+        "centroid": float(np.sum(np.arange(len(spectrum)) * spectrum) / total_spectrum if total_spectrum > 0 else 0)
+    }
+
+    # 归一化特征向量用于匹配
+    feature_vector = [
+        features["low_ratio"],
+        features["mid_ratio"],
+        features["high_ratio"],
+        min(features["attack_slope"] / 1000, 1.0),
+        min(features["peak_count"] / 50, 1.0),
+        min(features["centroid"] / 1000, 1.0)
+    ]
+
+    return features, feature_vector
+
+
+def classify_drum_type(features, velocity):
+    """根据特征初步分类鼓件类型"""
+    if features["low_ratio"] > 0.6 and features["attack_slope"] > 500:
+        return "kick"  # 地鼓：低频占比高，瞬态强
+    elif features["mid_ratio"] > 0.5 and features["peak_count"] > 10:
+        return "snare"  # 军鼓：中频丰富，谐波多
+    elif features["high_ratio"] > 0.7:
+        return "hihat" if velocity < 4e8 else "cymbal"  # 踩镲或镲片
+    elif features["mid_ratio"] > 0.4 and features["low_ratio"] > 0.3:
+        return "tom"  # 通鼓
+    else:
+        return "unknown"
+
+
+def classify_velocity(energy):
+    """根据能量分级打击力度"""
+    config = load_drum_config()
+    thresholds = config["velocity_thresholds"]
+
+    if energy < thresholds["soft"]:
+        return "soft"
+    elif energy < thresholds["medium"]:
+        return "medium"
+    else:
+        return "hard"
 
 
 def load_mapping():
+    """加载鼓件映射"""
     if not os.path.exists(MAPPING_FILE):
-        return {}
+        # 创建默认架子鼓映射
+        default_mapping = {
+            "kick": ["space", "z", "x"],  # 地鼓：空格/轻/z, 中/x, 重/c
+            "snare": ["a", "s", "d"],  # 军鼓
+            "hihat": ["q", "w", "e"],  # 踩镲
+            "tom_high": ["r", "t", "y"],  # 高音通鼓
+            "tom_mid": ["f", "g", "h"],  # 中音通鼓
+            "tom_low": ["v", "b", "n"],  # 低音通鼓
+            "cymbal": ["u", "i", "o"],  # 吊镲
+            "ride": ["j", "k", "l"],  # 叮叮镲
+            "crash": ["m", ",", "."]  # 碎音镲
+        }
+        save_mapping(default_mapping)
+        return default_mapping
+
     try:
         with open(MAPPING_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -77,10 +196,7 @@ def save_fingerprints(db):
 
 
 def _parse_key_name(name: str):
-    """将字符串键名映射到 pynput 的 Key 或直接字符。
-    支持示例：a, b, 1, space, enter, tab, esc, backspace, shift, ctrl, alt, up, down, left, right.
-    未匹配到特殊键时，返回原字符序列逐个输入。
-    """
+    """键盘映射解析"""
     if not name:
         return None
     lower = name.lower()
@@ -100,19 +216,19 @@ def _parse_key_name(name: str):
         "down": Key.down,
         "left": Key.left,
         "right": Key.right,
-        "delete": Key.delete,
-        "home": Key.home,
-        "end": Key.end,
-        "pageup": Key.page_up,
-        "pagedown": Key.page_down,
     }
     return special_map.get(lower, name)
 
 
 def send_keypress(key_name: str):
+    """发送按键"""
+    if not KEYBOARD_AVAILABLE or _kb is None:
+        return
+
     target = _parse_key_name(key_name)
-    if target is None or _kb is None:
-        raise RuntimeError("pynput 不可用或键名为空")
+    if target is None:
+        return
+
     if isinstance(target, Key):
         _kb.press(target)
         _kb.release(target)
@@ -120,25 +236,10 @@ def send_keypress(key_name: str):
         for ch in target:
             _kb.press(ch)
             _kb.release(ch)
-    else:
-        _kb.press(str(target))
-        _kb.release(str(target))
-
-
-# 旧的音高识别算法已移除，采用指纹匹配替代
-
-def fft_fingerprint(signal):
-    windowed = signal * np.hanning(len(signal))
-    spectrum = np.abs(np.fft.rfft(windowed))
-    # 归一化为单位向量以用于余弦相似度
-    norm = np.linalg.norm(spectrum)
-    if norm == 0:
-        return spectrum.tolist()
-    return (spectrum / norm).tolist()
 
 
 def _gather_frames(stream, first_chunk: np.ndarray, frames: int) -> np.ndarray:
-    """在触发后连续采集多帧数据，并与触发帧拼接为更长的信号。"""
+    """采集多帧数据"""
     if frames <= 1:
         return first_chunk
     buf = [first_chunk]
@@ -150,7 +251,7 @@ def _gather_frames(stream, first_chunk: np.ndarray, frames: int) -> np.ndarray:
 
 
 def cosine_similarity(vec_a, vec_b):
-    # 两向量需同长度；若不同，截断为最短长度
+    """余弦相似度"""
     n = min(len(vec_a), len(vec_b))
     if n == 0:
         return 0.0
@@ -162,166 +263,204 @@ def cosine_similarity(vec_a, vec_b):
     return float(np.dot(a, b) / denom)
 
 
-def draw_bar(energy, is_ready):
-    """在控制台绘制能量条，方便调试"""
-    # 将能量对数化以便显示
+def draw_drum_ui(energy, velocity_level, drum_type, is_ready):
+    """绘制架子鼓专用界面"""
+    # 能量条
     if energy < 1: energy = 1
     log_energy = np.log10(energy)
-
-    # 简单的缩放映射，根据你的麦克风可能需要调整 range
-    bar_len = int((log_energy - 4) * 10)
+    bar_len = int((log_energy - 7) * 8)  # 调整显示范围
     if bar_len < 0: bar_len = 0
     if bar_len > 50: bar_len = 50
 
     bar = "█" * bar_len + "░" * (50 - bar_len)
 
-    status = "🟢 待命 (Ready)" if is_ready else "🔴 锁定 (Locked)"
-    sys.stdout.write(f"\r能量: [{bar}] {int(energy)} | {status}")
+    # 力度指示器
+    velocity_icons = {"soft": "○", "medium": "◎", "hard": "●"}
+    velocity_icon = velocity_icons.get(velocity_level, "○")
+
+    # 鼓件颜色
+    drum_colors = {
+        "kick": "🟤", "snare": "🔴", "hihat": "🟢",
+        "tom": "🟡", "cymbal": "🔵", "unknown": "⚪"
+    }
+    drum_icon = drum_colors.get(drum_type, "⚪")
+
+    status = "🟢 READY" if is_ready else "🔴 LOCKED"
+
+    sys.stdout.write(f"\r[{drum_icon}{velocity_icon}] [{bar}] {drum_type:8} {velocity_level:6} | {status}")
     sys.stdout.flush()
 
 
-def run_detector(use_map=False, record_note=None, record_key=None, sim_threshold=0.9, min_energy=1e7, build_map=False,
-                 fp_frames=8):
+def run_drum_detector(use_map=False, record_drum=None, record_key=None,
+                      sim_threshold=0.85, build_map=False, auto_classify=False):
+    """架子鼓主检测函数"""
     p = pyaudio.PyAudio()
-    stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+    stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
+                    input=True, frames_per_buffer=CHUNK)
 
-    print("\n🎸 严谨防抖模式启动")
-    print(f"触发阈值: {ONSET_THRESHOLD} | 复位阈值: {RESET_THRESHOLD}")
-    mode = "交互建表" if build_map else ("指纹录入" if record_note else "指纹比对")
-    print(f"模式: {mode}")
-    print("---------------------------------------------------")
+    print("\n🥁 架子鼓检测模式启动")
+    print(f"触发阈值: {ONSET_THRESHOLD:,} | 复位阈值: {RESET_THRESHOLD:,}")
+    print(f"块大小: {CHUNK} | 采样率: {RATE}")
+    print("-" * 50)
 
-    prev_energy = 0
+    if auto_classify:
+        print("🤖 自动分类模式：系统将尝试自动识别鼓件类型")
 
-    # 核心状态标志：是否准备好接受下一次拨弦
-    # True = 安静等待中
-    # False = 刚刚拨过，正在等待琴弦静止
-    is_ready_to_trigger = True
-
+    # 加载配置
+    drum_config = load_drum_config()
     mapping = load_mapping()
     fingerprints = load_fingerprints()
 
-    if use_map and not KEYBOARD_AVAILABLE:
-        print("⚠️ 未能导入 pynput 库，无法发送键盘输入。请先安装: pip install pynput")
+    prev_energy = 0
+    is_ready_to_trigger = True
+    last_trigger_time = 0
+    min_interval = 0.05  # 最小触发间隔50ms，防止连击
 
     try:
         while True:
+            current_time = time.time()
+
             raw_data = stream.read(CHUNK, exception_on_overflow=False)
             data_int = np.frombuffer(raw_data, dtype=np.int16)
 
-            # 计算绝对总能量
             curr_energy = np.sum(data_int.astype(float) ** 2)
-
-            # 计算能量突变量 (Flux)
             flux = curr_energy - prev_energy
             prev_energy = curr_energy
 
-            # --- 状态机逻辑 ---
+            # 计算力度等级
+            velocity_level = classify_velocity(curr_energy)
 
+            # 状态机
             if is_ready_to_trigger:
-                # 状态 1: 待命模式
-                # 只有能量突然暴涨 (Flux > 阈值) 才会触发
-                if flux > ONSET_THRESHOLD:
+                # 检测打击触发
+                if flux > ONSET_THRESHOLD and curr_energy > MIN_ENERGY:
+                    # 检查时间间隔
+                    if current_time - last_trigger_time < min_interval:
+                        continue
 
-                    # 🎯 触发识别！
-                    # 换行打印以免破坏进度条显示
+                    last_trigger_time = current_time
+
+                    # 采集音频数据
+                    combined = _gather_frames(stream, data_int, FP_FRAMES)
+
+                    # 提取特征
+                    features, feature_vector = extract_drum_features(combined)
+
+                    # 自动分类鼓件类型
+                    drum_type = classify_drum_type(features, curr_energy)
+
                     sys.stdout.write("\n")
-                    # 采集更长的指纹窗口
-                    combined = _gather_frames(stream, data_int, fp_frames)
+
                     if build_map:
-                        # 交互式建表：为当前触发的 FFT 指纹绑定 NOTE 与 KEY
-                        fp = fft_fingerprint(combined.astype(float))
-                        # 自动生成编号，如 FP001、FP002...
-                        idx = max(
-                            [
-                                int(k[2:]) for k in fingerprints.keys()
-                                if isinstance(k, str) and k.startswith("FP") and k[2:].isdigit()
-                            ]
-                            , default=0) + 1
-                        note_input = f"FP{idx:03d}"
-                        print(f"ℹ️ 已分配默认编号: {note_input}")
-                        try:
-                            key_input = input("请输入要绑定的键(如 a/space/enter/1 等)：").strip()
-                        except EOFError:
-                            key_input = ""
-                        # 若未输入键名，则不保存指纹与映射
-                        if not key_input:
-                            print("ℹ️ 未输入键名，已跳过本次指纹保存。")
+                        # 交互式录制模式
+                        print(f"🎯 检测到打击 | 能量: {curr_energy:.2e} | 自动分类: {drum_type}")
+
+                        if auto_classify:
+                            # 使用自动分类结果
+                            base_name = drum_type
+                            idx = 1
+                            while f"{base_name}_{idx}" in fingerprints:
+                                idx += 1
+                            drum_name = f"{base_name}_{idx}"
+                            print(f"🤖 自动命名为: {drum_name}")
                         else:
-                            # 写入指纹库
-                            fingerprints[note_input] = {
-                                "fingerprint": fp,
+                            # 手动输入名称
+                            drum_name = input("请输入鼓件名称 (如 kick_1, snare, hihat): ").strip()
+                            if not drum_name:
+                                drum_name = f"drum_{len(fingerprints) + 1}"
+
+                        # 获取按键映射
+                        if drum_type in mapping:
+                            default_keys = mapping[drum_type]
+                            velocity_idx = 0 if velocity_level == "soft" else 1 if velocity_level == "medium" else 2
+                            default_key = default_keys[velocity_idx]
+                            print(f"💡 建议按键: {default_key} (根据力度自动选择)")
+
+                        key_input = input("请输入按键映射 (回车使用建议键): ").strip()
+                        if not key_input and 'default_key' in locals():
+                            key_input = default_key
+
+                        if key_input:
+                            # 保存指纹
+                            fingerprints[drum_name] = {
+                                "fingerprint": feature_vector,
+                                "features": features,
+                                "drum_type": drum_type,
+                                "velocity": velocity_level,
                                 "key": key_input
                             }
-                            ok_fp = save_fingerprints(fingerprints)
-                            # 同步到映射文件（回退用）
-                            mapping[note_input] = key_input
-                            ok_map = save_mapping(mapping)
-                            status_fp = "✅ 指纹已保存" if ok_fp else "❌ 指纹保存失败"
-                            status_map = "✅ 映射已保存" if ok_map else "❌ 映射保存失败"
-                            print(f"{status_fp} 到 {FINGERPRINT_FILE}；{status_map} 到 {MAPPING_FILE}")
-                    elif record_note:
-                        # 指纹录入模式：保存当前 FFT 指纹到库
-                        fp = fft_fingerprint(combined.astype(float))
-                        fingerprints[record_note] = {
-                            "fingerprint": fp,
-                            "key": record_key or mapping.get(record_note, "")
-                        }
-                        if save_fingerprints(fingerprints):
-                            print(
-                                f"✅ 已录入指纹: {record_note} -> {len(fp)} 维，键: {fingerprints[record_note]['key']}，文件: {FINGERPRINT_FILE}")
-                        else:
-                            print(f"❌ 指纹写入失败: {FINGERPRINT_FILE}")
-                    else:
-                        # 指纹比对模式（默认）
-                        fp_cur = fft_fingerprint(combined.astype(float))
-                        best_note = None
-                        best_sim = 0.0
-                        for n, item in fingerprints.items():
-                            sim = cosine_similarity(fp_cur, item.get("fingerprint", []))
-                            if sim > best_sim:
-                                best_sim = sim
-                                best_note = n
-                        energy = np.sum(combined.astype(float) ** 2)
-                        preview_key = None
-                        if best_note:
-                            preview_key = fingerprints.get(best_note, {}).get("key", mapping.get(best_note, ""))
-                        shown = preview_key if (preview_key and isinstance(preview_key, str) and len(
-                            preview_key) > 0) else best_note
-                        print(f"🔎 最相似: {shown} | 相似度: {best_sim:.3f}")
-                        if best_note and best_sim >= sim_threshold and energy >= min_energy:
-                            key = fingerprints.get(best_note, {}).get("key", mapping.get(best_note, ""))
-                            if key:
-                                print(f"🚀 指纹命中: {best_note} -> {key} | sim={best_sim:.3f}")
-                                if use_map and KEYBOARD_AVAILABLE:
-                                    try:
-                                        send_keypress(key)
-                                        print("⌨️ 已发送键盘输入 (pynput)。")
-                                    except Exception as e:
-                                        print(f"⚠️ 发送键盘输入失败: {e}")
-                            else:
-                                print(f"   指纹命中: {best_note}，但无键映射。")
-                        else:
-                            print("   未达到相似度或能量阈值。")
 
-                    # 🔒 立即锁死系统
+                            if save_fingerprints(fingerprints):
+                                print(f"✅ 已保存: {drum_name} -> {key_input}")
+                            else:
+                                print("❌ 保存失败")
+
+                    elif record_drum:
+                        # 指定名称录制模式
+                        fingerprints[record_drum] = {
+                            "fingerprint": feature_vector,
+                            "features": features,
+                            "drum_type": drum_type,
+                            "velocity": velocity_level,
+                            "key": record_key or ""
+                        }
+
+                        if save_fingerprints(fingerprints):
+                            print(f"✅ 已录制: {record_drum} | 类型: {drum_type} | 力度: {velocity_level}")
+                        else:
+                            print("❌ 录制失败")
+
+                    else:
+                        # 识别模式
+                        best_match = None
+                        best_sim = 0.0
+
+                        for name, data in fingerprints.items():
+                            stored_vector = data.get("fingerprint", [])
+                            sim = cosine_similarity(feature_vector, stored_vector)
+
+                            # 考虑鼓件类型和力度的权重
+                            type_bonus = 0.1 if data.get("drum_type", "") == drum_type else 0
+                            velocity_bonus = 0.05 if data.get("velocity", "") == velocity_level else 0
+                            sim_adj = sim + type_bonus + velocity_bonus
+
+                            if sim_adj > best_sim:
+                                best_sim = sim_adj
+                                best_match = name
+
+                        if best_match and best_sim >= sim_threshold:
+                            drum_data = fingerprints[best_match]
+                            key_to_press = drum_data.get("key", "")
+
+                            print(f"🥁 识别: {best_match} | 类型: {drum_type} | 力度: {velocity_level}")
+                            print(f"  相似度: {best_sim:.3f} | 键位: {key_to_press}")
+
+                            if key_to_press and use_map and KEYBOARD_AVAILABLE:
+                                try:
+                                    send_keypress(key_to_press)
+                                    print(f"⌨️ 触发按键: {key_to_press}")
+                                except Exception as e:
+                                    print(f"⚠️ 按键失败: {e}")
+                        else:
+                            print(f"❓ 未知打击 | 类型: {drum_type} | 力度: {velocity_level}")
+                            print(f"  最高相似度: {best_sim:.3f} (阈值: {sim_threshold})")
+
+                    # 锁定系统，防止连击
                     is_ready_to_trigger = False
 
             else:
-                # 状态 2: 锁定模式 (Reseting)
-                # 在这个模式下，无论怎么拨弦，程序都不理会
-                # 只有当绝对能量 (curr_energy) 降到非常低 (RESET_THRESHOLD) 时
-                # 才重新把系统设为 "Ready"
-
+                # 锁定状态，等待复位
                 if curr_energy < RESET_THRESHOLD:
                     is_ready_to_trigger = True
-                    # sys.stdout.write("\n🔄 系统复位，准备下次拨弦...\n") # 调试用，嫌吵可注释
 
-            # 绘制实时能量条 (可选，会降低一点点性能)
-            draw_bar(curr_energy, is_ready_to_trigger)
+            # 更新UI显示
+            draw_drum_ui(curr_energy, velocity_level,
+                         drum_type if 'drum_type' in locals() else "unknown",
+                         is_ready_to_trigger)
 
     except KeyboardInterrupt:
-        print("\n停止。")
+
+        print("\n\n⏹️ 停止检测")
     finally:
         stream.stop_stream()
         stream.close()
@@ -329,24 +468,38 @@ def run_detector(use_map=False, record_note=None, record_key=None, sim_threshold
 
 
 def main():
-    parser = argparse.ArgumentParser(description="吉他指纹识别 + 键盘触发")
-    parser.add_argument("--use-map", action="store_true", help="指纹命中时发送键盘输入")
-    parser.add_argument("--build-map", action="store_true", help="连续交互式建表：每次触发后录入音符与按键")
-    parser.add_argument("--record-fp", metavar="NOTE", help="指纹录入：当触发时录入当前 FFT 为指定音符的模板")
-    parser.add_argument("--record-key", metavar="KEY", help="与 --record-fp 一起使用，指定该音符的键映射")
-    parser.add_argument("--sim-th", type=float, default=0.9, help="指纹相似度阈值，默认 0.9")
-    parser.add_argument("--min-energy", type=float, default=1e7, help="能量阈值，默认 1e7")
-    parser.add_argument("--fp-frames", type=int, default=8, help="录入/匹配指纹时连续采集的帧数，默认 8")
+    parser = argparse.ArgumentParser(description="架子鼓音频识别系统")
+    parser.add_argument("--use-map", action="store_true", help="识别时发送键盘输入")
+    parser.add_argument("--build-map", action="store_true", help="交互式录制模式")
+    parser.add_argument("--record-drum", metavar="NAME", help="录制指定名称的鼓件")
+    parser.add_argument("--record-key", metavar="KEY", help="录制时指定按键映射")
+    parser.add_argument("--sim-th", type=float, default=0.85, help="相似度阈值，默认0.85")
+    parser.add_argument("--auto-classify", action="store_true", help="自动分类鼓件类型")
+    parser.add_argument("--list-drums", action="store_true", help="显示已录制的鼓件")
+
     args = parser.parse_args()
 
-    run_detector(
+    if args.list_drums:
+        fingerprints = load_fingerprints()
+        if fingerprints:
+            print("\n🥁 已录制的鼓件:")
+            print("-" * 60)
+            for name, data in fingerprints.items():
+                drum_type = data.get("drum_type", "unknown")
+                velocity = data.get("velocity", "unknown")
+                key = data.get("key", "未设置")
+                print(f"{name:20} | 类型: {drum_type:10} | 力度: {velocity:8} | 按键: {key}")
+        else:
+            print("📭 未找到任何鼓件记录")
+        return
+
+    run_drum_detector(
         use_map=args.use_map,
-        record_note=args.record_fp,
+        record_drum=args.record_drum,
         record_key=args.record_key,
         sim_threshold=args.sim_th,
-        min_energy=args.min_energy,
         build_map=args.build_map,
-        fp_frames=args.fp_frames,
+        auto_classify=args.auto_classify
     )
 
 
